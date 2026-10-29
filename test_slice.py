@@ -1,3 +1,4 @@
+import pytest
 """Tests for the Tier-1 slice. Run: python3 -m pytest test_slice.py -q
 (or plain: python3 test_slice.py)"""
 from permit_memory_graph import PermitMemoryGraph, SqliteGraphStore
@@ -281,3 +282,29 @@ if __name__ == "__main__":
             traceback.print_exc()
     print(f"{len(fns) - failed}/{len(fns)} passed")
     raise SystemExit(1 if failed else 0)
+
+
+def test_update_where_rejects_injection_in_key():
+    # Audit: update_where spliced `key` and match keys into the SQL text.
+    g = _g()
+    g.claim_spend("agent-a", "p1", "m1", 1_000, "cloud-gpu")
+    payloads = [
+        "status', 'x') , label = ('pwned",
+        "status') WHERE 1=1; DROP TABLE nodes; --",
+        "a.b",
+        "",
+    ]
+    for bad in payloads:
+        with pytest.raises(ValueError):
+            g.s.update_where("Claim", {"permit_id": "p1"}, bad, "void")
+        with pytest.raises(ValueError):
+            g.s.update_where("Claim", {bad: "p1"}, "status", "void")
+    # nothing changed, table intact
+    assert len(g.s.find("Claim", permit_id="p1", status="active")) == 1
+    assert g.s.stats()["nodes"] > 0
+
+
+def test_find_ignores_injection_key_safely():
+    g = _g()
+    g.claim_spend("agent-a", "p1", "m1", 1_000, "cloud-gpu")
+    assert g.s.find("Claim", **{"x') OR 1=1 --": "y"}) == []

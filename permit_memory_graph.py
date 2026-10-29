@@ -29,6 +29,7 @@ import json
 import sqlite3
 import time
 import uuid
+import re
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 
@@ -91,6 +92,23 @@ class GraphStore:
         override with a single bulk statement."""
         for node in self.find(label, **match):
             self.set_prop(node["id"], key, value, label=label)
+
+
+# Property keys and labels end up inside SQL JSON paths / Cypher text, which
+# cannot be bound as parameters without losing the expression indexes, so
+# they are allowlisted to plain ASCII identifiers instead. Values are always
+# bound parameters.
+_IDENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,63}")
+
+
+def _is_ident(name) -> bool:
+    return isinstance(name, str) and _IDENT.fullmatch(name) is not None
+
+
+def _ident(name) -> str:
+    if not _is_ident(name):
+        raise ValueError(f"invalid identifier: {name!r}")
+    return name
 
 
 class SqliteGraphStore(GraphStore):
@@ -204,7 +222,7 @@ class SqliteGraphStore(GraphStore):
         q = "SELECT * FROM nodes WHERE label=?"
         args: list = [label]
         for k, v in prop_eq.items():
-            if k.isidentifier():
+            if _is_ident(k):
                 q += f" AND json_extract(props, '$.{k}') IS ?"
                 args.append(v)
         out = []
@@ -220,6 +238,8 @@ class SqliteGraphStore(GraphStore):
         # json_quote keeps the value a JSON string (status text is the
         # cascade's use); without it SQLite would re-type values that
         # happen to look like JSON numbers/booleans.
+        key = _ident(key)
+        match = {_ident(k): v for k, v in match.items()}
         q = ("UPDATE nodes SET props = json_set(props, '$." + key +
              "', json_quote(?))")
         args: list = [value]
@@ -333,7 +353,8 @@ class FalkorGraphStore(GraphStore):
             )
 
     def get_node(self, node_id, label=None):
-        pat = f"(n:{label} {{id: $id}})" if label else "(n {id: $id})"
+        key = _ident(key)
+        pat = f"(n:{_ident(label)} {{id: $id}})" if label else "(n {id: $id})"
         res = self._g.query(f"MATCH {pat} RETURN n", {"id": node_id})
         if not res.result_set:
             return None
@@ -341,7 +362,7 @@ class FalkorGraphStore(GraphStore):
         return {"id": node.id, **dict(node.properties)}
 
     def neighbours(self, node_id, rel=None):
-        rel_pat = f":{rel}" if rel else ""
+        rel_pat = f":{_ident(rel)}" if rel else ""
         res = self._g.query(
             f"MATCH (a {{id: $id}})-[r{rel_pat}]->(b) RETURN type(r), b",
             {"id": node_id},
@@ -353,12 +374,15 @@ class FalkorGraphStore(GraphStore):
         ]
 
     def find(self, label, **prop_eq):
+        label = _ident(label)
+        prop_eq = {_ident(k): v for k, v in prop_eq.items()}
         where = " AND ".join(f"n.{k} = ${k}" for k in prop_eq) or "true"
         res = self._g.query(f"MATCH (n:{label}) WHERE {where} RETURN n", prop_eq)
         return [{"id": r[0].id, **dict(r[0].properties)} for r in res.result_set]
 
     def set_prop(self, node_id, key, value, label=None):
-        pat = f"(n:{label} {{id: $id}})" if label else "(n {id: $id})"
+        key = _ident(key)
+        pat = f"(n:{_ident(label)} {{id: $id}})" if label else "(n {id: $id})"
         self._g.query(
             f"MATCH {pat} SET n.{key} = $v", {"id": node_id, "v": value}
         )
@@ -366,6 +390,8 @@ class FalkorGraphStore(GraphStore):
     def update_where(self, label, match, key, value):
         # One Cypher statement for the whole cascade (revoke voided one
         # claim per round trip before this: ~27 ms x D claims).
+        label, key = _ident(label), _ident(key)
+        match = {_ident(k): v for k, v in match.items()}
         where = " AND ".join(f"n.{k} = ${k}" for k in match) or "true"
         self._g.query(
             f"MATCH (n:{label}) WHERE {where} SET n.{key} = $__v",
